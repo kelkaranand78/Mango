@@ -1,0 +1,3 @@
+https://mango-orders-19e85-default-rtdb.firebaseio.com/
+
+"AIzaSyBh-dFG2MpZhrf_LF3fGYE6rfSGXrepZho"
