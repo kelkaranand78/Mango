@@ -344,9 +344,21 @@ html,body{height:100%;margin:0;padding:0;overflow:hidden}
 </style>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
 </head>
 <body>
+
+<div id="auth-prompt" style="display:none;position:fixed;inset:0;background:rgba(20,8,2,.92);z-index:9999;align-items:center;justify-content:center;padding:20px">
+  <div style="background:var(--warm-white);border-radius:16px;max-width:420px;width:100%;padding:32px 28px;text-align:center;box-shadow:0 24px 60px rgba(0,0,0,.4)">
+    <div style="font-size:50px;margin-bottom:12px">🥭</div>
+    <h2 style="font-family:'Playfair Display',serif;font-size:22px;color:var(--amber-d);margin-bottom:8px">Mango Order Manager</h2>
+    <p id="auth-msg" style="color:var(--text-l);margin-bottom:20px;font-size:14px;line-height:1.6">Sign in with your Google account to continue.</p>
+    <button id="auth-signin-btn" class="btn b-amber b-lg" style="width:100%" onclick="signInWithGoogle()">🔐 Sign in with Google</button>
+    <button id="auth-signout-btn" class="btn b-red" style="width:100%;margin-top:8px;display:none" onclick="signOutUser()">Sign out</button>
+    <p id="auth-err" style="color:#c62828;font-size:13px;margin-top:12px;display:none"></p>
+  </div>
+</div>
 
 <div id="load-prompt" style="display:none;position:fixed;inset:0;background:rgba(20,8,2,.8);z-index:9998;align-items:center;justify-content:center;padding:20px">
   <div style="background:var(--warm-white);border-radius:16px;max-width:440px;width:100%;padding:28px;text-align:center;box-shadow:0 24px 60px rgba(0,0,0,.4)">
@@ -477,7 +489,12 @@ const TABS = [
 const BAKED_FB_CONFIG = {
   apiKey:      'AIzaSyBh-dFG2MpZhrf_LF3fGYE6rfSGXrepZho',
   databaseURL: 'https://mango-orders-19e85-default-rtdb.firebaseio.com/',
+  authDomain:  'mango-orders-19e85.firebaseapp.com',
 };
+// Only these Google accounts can read/write the database.
+// IMPORTANT: must stay in sync with the .read/.write rules in
+// Firebase Console → Realtime Database → Rules.
+const ALLOWED_EMAILS = ['kelkaranand@gmail.com'];
 // ═══════════════════════════════════════════════
 const APP_VERSION = 2; // bump this each time you add a migration
 
@@ -556,28 +573,68 @@ function fromFirebase(data){
   return d;
 }
 
+let fbAuthBound=false;
+let fbCurrentUser=null;
+
 function initFirebase(cfg){
-  if(typeof firebase==='undefined'){syncStatus('⚠️ Firebase SDK not loaded');return;}
+  if(typeof firebase==='undefined'){syncStatus('⚠️ Firebase SDK not loaded');return false;}
+  if(!firebase.auth){syncStatus('⚠️ Firebase Auth SDK not loaded');return false;}
   try{
-    // Use default app — avoids "app already exists" issues
     let app;
     try{
-      app=firebase.app(); // get default if exists
-      // Check if same config
-      const opts=app.options;
-      if(opts.databaseURL!==cfg.databaseURL){
+      app=firebase.app();
+      if(app.options.databaseURL!==cfg.databaseURL){
+        // Config changed — tear everything down and reinitialize
+        try{ if(fbListener && fbRef) fbRef.off('value',fbListener); }catch(e){}
+        fbListener=null; fbRef=null; fbDb=null;
+        fbAuthBound=false;
         app.delete().catch(()=>{});
         app=firebase.initializeApp(cfg);
       }
     }catch(e){
-      app=firebase.initializeApp(cfg); // no default app yet
+      app=firebase.initializeApp(cfg);
     }
     fbApp=app;
+    FB_CFG=cfg; saveFbCfg(cfg);
+    if(!fbAuthBound){
+      fbAuthBound=true;
+      firebase.auth().onAuthStateChanged(handleAuthChanged);
+    }
+    return true;
+  }catch(e){
+    syncStatus('❌ Init: '+e.message);
+    console.error('Firebase init error:',e);
+    return false;
+  }
+}
+
+function handleAuthChanged(user){
+  fbCurrentUser=user;
+  const email=user?(user.email||'').toLowerCase():null;
+  if(user && ALLOWED_EMAILS.includes(email)){
+    hideAuthPrompt();
+    connectFirebaseDb();
+    rerender();
+  } else if(user){
+    disconnectFirebaseDb();
+    showAuthPrompt('Account '+user.email+' is not authorized to use this app. Sign out and use an allowlisted account.', true);
+    syncStatus('🔒 Not authorized', false);
+    rerender();
+  } else {
+    disconnectFirebaseDb();
+    showAuthPrompt('Sign in with your Google account to continue.', false);
+    syncStatus('🔒 Signed out', false);
+    rerender();
+  }
+}
+
+function connectFirebaseDb(){
+  if(!fbApp) return;
+  if(fbRef && fbListener) return; // already connected
+  try{
     fbDb=firebase.database(fbApp);
     fbRef=fbDb.ref('mango_mgr');
-    FB_CFG=cfg; saveFbCfg(cfg);
     syncStatus('🔄 Connecting…');
-    if(fbListener){ try{fbRef.off('value',fbListener);}catch(e){} }
     fbListener=fbRef.on('value',snap=>{
       const raw=snap.val();
       if(raw){
@@ -593,30 +650,65 @@ function initFirebase(cfg){
           fbRef.set(S).catch(e=>syncStatus('❌ Write: '+e.message));
         }
       }
-      document.getElementById('load-prompt').style.display='none';
+      const lp=document.getElementById('load-prompt'); if(lp) lp.style.display='none';
       syncStatus('🔥 Live · '+new Date().toLocaleTimeString());
       rerender();
     },err=>{
       syncStatus('⚠️ Firebase: '+err.code);
       rerender();
     });
-    return true;
   }catch(e){
-    syncStatus('❌ Init: '+e.message);
-    console.error('Firebase init error:',e);
-    fbRef=null;
-    return false;
+    syncStatus('❌ DB: '+e.message);
+    console.error('connectFirebaseDb error:',e);
+    fbRef=null; fbDb=null; fbListener=null;
   }
 }
 
-function disconnectFirebase(){
-  if(fbListener && fbRef) fbRef.off('value', fbListener);
+function disconnectFirebaseDb(){
+  if(fbListener && fbRef){ try{ fbRef.off('value',fbListener); }catch(e){} }
   fbListener=null; fbRef=null; fbDb=null;
+}
+
+function disconnectFirebase(){
+  // Full disconnect — used by the manual "Disconnect" button when no config is baked
+  disconnectFirebaseDb();
+  if(typeof firebase!=='undefined' && firebase.auth){
+    try{ firebase.auth().signOut(); }catch(e){}
+  }
   if(fbApp){ try{ fbApp.delete(); }catch(e){} fbApp=null; }
   FB_CFG=null;
+  fbAuthBound=false;
   localStorage.removeItem(fbCfgKey());
   syncStatus('');
   toast('Firebase disconnected. Using local storage only.');
+}
+
+// ── Auth helpers ─────────────────────────────────────────────────────────────
+function signInWithGoogle(){
+  if(typeof firebase==='undefined' || !firebase.auth){ toast('Auth SDK not loaded',false); return; }
+  const provider=new firebase.auth.GoogleAuthProvider();
+  const errEl=document.getElementById('auth-err');
+  if(errEl){ errEl.style.display='none'; errEl.textContent=''; }
+  firebase.auth().signInWithPopup(provider).catch(e=>{
+    if(errEl){ errEl.style.display='block'; errEl.textContent='Sign-in failed: '+(e.message||e.code||e); }
+  });
+}
+function signOutUser(){
+  if(typeof firebase==='undefined' || !firebase.auth) return;
+  firebase.auth().signOut().catch(e=>toast('Sign-out failed: '+e.message,false));
+}
+function showAuthPrompt(msg, showSignOut){
+  const el=document.getElementById('auth-prompt');
+  if(!el) return;
+  el.style.display='flex';
+  const m=document.getElementById('auth-msg'); if(m) m.textContent=msg||'Sign in with your Google account to continue.';
+  const errEl=document.getElementById('auth-err'); if(errEl){ errEl.style.display='none'; errEl.textContent=''; }
+  const so=document.getElementById('auth-signout-btn'); if(so) so.style.display=showSignOut?'block':'none';
+  const si=document.getElementById('auth-signin-btn'); if(si) si.style.display=showSignOut?'none':'block';
+}
+function hideAuthPrompt(){
+  const el=document.getElementById('auth-prompt');
+  if(el) el.style.display='none';
 }
 
 // ═══════════════════════════════════════════════
@@ -1059,6 +1151,10 @@ function renderSetup(){
         ?`<div style="background:var(--green-l);border:1px solid #a5d6a7;border-radius:9px;padding:10px 14px;font-size:14px;color:var(--green)">
             ✅ All users share the same live database. Changes sync in real-time across all browsers.
           </div>
+          ${fbCurrentUser?`<div style="margin-top:10px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;background:#f8f5ee;border:1px solid var(--border);border-radius:9px;padding:10px 14px;font-size:14px">
+            <span>👤 Signed in as <b>${esc(fbCurrentUser.email||'')}</b></span>
+            <button class="btn b-outline b-sm" onclick="signOutUser()">Sign out</button>
+          </div>`:''}
           ${!fbBaked?`<div style="margin-top:12px"><button class="btn b-red" onclick="if(confirm('Disconnect Firebase?'))disconnectFirebase();rerender()">🔌 Disconnect</button></div>`:''}
           `
         :fbBaked
@@ -3324,11 +3420,18 @@ function bakeFirebaseConfig(){
   const key=(document.getElementById('fb-key')?.value||'').trim();
   if(!url||!key) return toast('Enter both Database URL and API Key first.',false);
   if(!url.includes('firebaseio.com')) return toast('Database URL must end with firebaseio.com',false);
-  initFirebase({apiKey:key,databaseURL:url});
+  // Derive authDomain from the database URL: <project-id>[-default-rtdb].firebaseio.com → <project-id>.firebaseapp.com
+  let authDomain='';
+  try{
+    const host=new URL(url).hostname;
+    const projectId=host.replace(/\.firebaseio\.com$/,'').replace(/-default-rtdb$/,'');
+    authDomain=projectId+'.firebaseapp.com';
+  }catch(e){ return toast('Invalid Database URL.',false); }
+  initFirebase({apiKey:key,databaseURL:url,authDomain});
   let src='<!DOCTYPE html>\n'+document.documentElement.outerHTML;
   src=src.replace(
     /const BAKED_FB_CONFIG\s*=\s*\{[\s\S]*?\};/,
-    "const BAKED_FB_CONFIG = {\n  apiKey:      '"+key+"',\n  databaseURL: '"+url+"',\n};"
+    "const BAKED_FB_CONFIG = {\n  apiKey:      '"+key+"',\n  databaseURL: '"+url+"',\n  authDomain:  '"+authDomain+"',\n};"
   );
   src=src.replace(/<script>\/\* embedded data \*\/[\s\S]*?<\/script>\s*/g,'');
   const blob=new Blob([src],{type:'text/html;charset=utf-8'});
@@ -3363,8 +3466,9 @@ const _cfgToUse=_bakedOk?BAKED_FB_CONFIG:(_savedCfg?.apiKey?_savedCfg:null);
 
 if(_cfgToUse){
   syncStatus('🔄 Connecting…');
+  // initFirebase only sets up app + auth listener; the auth listener decides
+  // whether to show the sign-in modal or call connectFirebaseDb().
   try{ initFirebase(_cfgToUse); }catch(e){ syncStatus('❌ Init failed: '+e.message); console.error(e); }
-  setTimeout(()=>{ if(!fbRef){ try{ initFirebase(_cfgToUse); }catch(e){} } }, 3000);
 } else {
   if(!S.seasons.length&&!S.customers.length){
     document.getElementById('load-prompt').style.display='flex';
